@@ -31,6 +31,7 @@ aicha/
 ├── requirements.txt       # Dépendances Python
 ├── .env.example           # Modèle de variables d'environnement
 └── .gitignore             # Exclusion des secrets, logs et données lourdes
+```
 🛠️ Installation et Démarrage
 1. Prérequis
 Docker Desktop installé avec le support WSL2 et GPU Pass-through.
@@ -39,7 +40,7 @@ Git.
 
 2. Cloner le dépôt
 Bash
-git clone https://github.com/votre-compte/aicha.git
+git clone https://github.com/aichamehrez/aicha.git
 cd aicha
 3. Configurer l'environnement
 Copiez le modèle de configuration et adaptez-le à votre environnement local :
