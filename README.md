@@ -1,4 +1,3 @@
-\Markdown
 # 🤖 aicha — Autonomous Local AI Agent Node
 
 Bienvenue sur le dépôt du nœud d'agent IA local **aicha**. Ce projet propose un environnement d'exécution conteneurisé pour l'automatisation de tests QA, l'analyse visuelle UI/UX et l'orchestration de tâches d'infrastructure.
