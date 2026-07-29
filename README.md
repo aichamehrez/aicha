@@ -31,34 +31,31 @@ aicha/
 ├── .env.example           # Modèle de variables d'environnement
 └── .gitignore             # Exclusion des secrets, logs et données lourdes
 ```
-🛠️ Installation et Démarrage
+🛠️ Installation et Démarrage   
 1. Prérequis
-Docker Desktop installé avec le support WSL2 et GPU Pass-through.
-
-Git.
+* Docker Desktop installé avec le support WSL2 et GPU Pass-through.
+* Git.
 
 2. Cloner le dépôt
+```text
 Bash
 git clone [https://github.com/aichamehrez/aicha.git](https://github.com/aichamehrez/aicha.git)
-
 cd aicha
-
-4. Configurer l'environnement
+```
+3. Configurer l'environnement
 Copiez le modèle de configuration et adaptez-le à votre environnement local :
-
+```text
 Bash
-
 cp .env.example .env
-
-
+```
 4. Démarrer les services
-Lancez l'ensemble des conteneurs en arrière-plan via Docker Compose :
 
+Lancez l'ensemble des conteneurs en arrière-plan via Docker Compose :
+```text
 Bash
 docker compose up -d
-
-
+```
 🔒 Sécurité et Bonnes Pratiques
-Les clés d'accès, mots de passe de VM et données temporaires sont entièrement ignorés via le fichier .gitignore.
 
-Aucune donnée confidentielle ou clé API réelle n'est présente sur ce dépôt.
+* Les clés d'accès, mots de passe de VM et données temporaires sont entièrement ignorés via le fichier .gitignore.
+* Aucune donnée confidentielle ou clé API réelle n'est présente sur ce dépôt.
