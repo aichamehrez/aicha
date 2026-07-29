@@ -1,0 +1,286 @@
+# ==============================================================================
+#  OpenClaw + Ollama — Master Docker Compose Stack
+#  Compose spec: v3.9+  |  Requires: Docker Engine ≥ 24, NVIDIA Container Toolkit
+#
+#  Key capabilities:
+#    • NVIDIA GPU passthrough to Ollama (all GPUs)
+#    • Isolated bridge network (agent-net) with host routing intact
+#    • Full .env variable injection into both services
+#    • Persistent named volumes for model weights and agent data
+#    • Health-gate startup ordering (OpenClaw waits for Ollama readiness)
+# ==============================================================================
+
+services:
+
+  # ────────────────────────────────────────────────────────────────────────────
+  #  SERVICE: ollama
+  #  Custom build: ollama/ollama:latest + hardware scanner tools baked in.
+  #
+  #  Hardware visibility flags:
+  #    pid: host      → shares host PID namespace → sees full host CPU/RAM
+  #    privileged     → allows /sys access, nvidia-smi, PCI bus reads
+  #    /host/proc     → host /proc bind-mount → real CPU/RAM for scanner tools
+  #    /host/sys      → host /sys  bind-mount → PCI/GPU topology
+  #    nvidia runtime → VRAM, compute cap, driver version via nvidia-smi
+  #
+  #  On startup: /scan.sh runs first, prints hardware report + model
+  #  recommendations, then hands off to `ollama serve`.
+  # ────────────────────────────────────────────────────────────────────────────
+  ollama:
+    build:
+      context: .
+      dockerfile: Dockerfile.ollama
+    container_name: ollama
+    image: openclaw/ollama-scanner:latest # local tag for the built image
+
+    restart: unless-stopped
+
+    # ── Full host hardware visibility ──────────────────────────────────────────
+    # pid: host gives the container the same PID/hardware namespace as the host.
+    # Combined with the volume mounts below, scanner tools read REAL specs.
+    pid: host
+
+    # privileged: true is required for:
+    #   • Full /sys PCI device tree access (GPU topology, NUMA info)
+    #   • nvidia-smi NVML access outside the NVIDIA runtime path
+    #   • lspci hardware enumeration
+    privileged: true
+
+    # ── Port exposure ──────────────────────────────────────────────────────────
+    ports:
+      - "11434:11434" # Ollama REST API — host and agent-net
+
+    # ── Volume mounts ──────────────────────────────────────────────────────────
+    volumes:
+      # Model weight persistence
+      - ./ollama-data:/root/.ollama
+
+      # ── Host hardware passthrough (read-only) ──────────────────────────────
+      # The scan.sh script reads these to get real host CPU, RAM, and GPU info.
+      - /proc:/host/proc:ro # Host /proc → CPU model, core count, RAM
+      - /sys:/host/sys:ro # Host /sys  → PCI bus, GPU topology, NUMA
+      - /dev:/host/dev:ro # Host /dev  → GPU device nodes
+
+      # Scan report output — survives container restarts
+      - ./ollama-scan:/scan
+
+    # ── NVIDIA GPU passthrough ─────────────────────────────────────────────────
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all # Assign every available GPU
+              capabilities:
+                - gpu # Core GPU compute
+                - compute # CUDA compute capability
+                - utility # nvidia-smi / NVML tooling
+
+    # ── Runtime environment ────────────────────────────────────────────────────
+    environment:
+      OLLAMA_FLASH_ATTENTION: "1"
+      OLLAMA_KEEP_ALIVE: "24h"
+      OLLAMA_NUM_PARALLEL: "2"
+      NVIDIA_VISIBLE_DEVICES: "${NVIDIA_VISIBLE_DEVICES}"
+      # CUDA_VISIBLE_DEVICES intentionally omitted — Ollama manages CUDA via nvidia runtime.
+      # Setting it manually causes the "user overrode visible devices" fallback to CPU.
+      HOST_PROC: "/host/proc"
+      HOST_SYS: "/host/sys"
+
+    # ── Health check ──────────────────────────────────────────────────────────
+    # start_period is longer because /scan.sh runs hardware detection first
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:11434/api/tags" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s # Extra time for scan + GPU model loading
+
+    # ── Network attachment ─────────────────────────────────────────────────────
+    networks:
+      - agent-net
+
+    # ── Logging ───────────────────────────────────────────────────────────────
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m" # Larger — captures full scan report in logs
+        max-file: "3"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  #  SERVICE: ollama-init
+  #  One-shot container: reads OLLAMA_MODEL_NAME + OLLAMA_EXTRA_MODELS from
+  #  .env and pulls every model via the Ollama REST API automatically.
+  #  Exits cleanly when done. OpenClaw waits for this before starting.
+  # ────────────────────────────────────────────────────────────────────────────
+  ollama-init:
+    image: curlimages/curl:latest
+    container_name: ollama-init
+    restart: "no"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_MODEL_NAME: "${OLLAMA_MODEL_NAME}"
+      OLLAMA_EXTRA_MODELS: "${OLLAMA_EXTRA_MODELS}"
+    entrypoint: [ "/bin/sh", "-c" ]
+    command:
+      - |
+        set -e
+        OLLAMA_URL="http://ollama:11434"
+        pull_model() {
+          M="$$1"
+          echo "--- Pulling: $$M"
+          curl -sf --max-time 3600 -X POST "$$OLLAMA_URL/api/pull" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\":\"$$M\",\"stream\":false}" | tail -c 200 || true
+          echo ""
+          echo "Done: $$M"
+        }
+        echo "==== AUTO-PULL START ===="
+        echo "Primary : $$OLLAMA_MODEL_NAME"
+        echo "Extras  : $$OLLAMA_EXTRA_MODELS"
+        pull_model "$$OLLAMA_MODEL_NAME"
+        if [ -n "$$OLLAMA_EXTRA_MODELS" ]; then
+          printf '%s' "$$OLLAMA_EXTRA_MODELS" | tr ',' '\n' | while IFS= read -r M; do
+            M=$$(printf '%s' "$$M" | tr -d ' ')
+            [ -n "$$M" ] && pull_model "$$M"
+          done
+        fi
+        echo "==== ALL MODELS READY ===="
+        curl -s "$$OLLAMA_URL/api/tags" | grep -o '"name":"[^"]*"'
+    networks:
+      - agent-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "2"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  #  SERVICE: openclaw
+  #  AI agent runtime built from the local Dockerfile (extending the official image).
+  #  Wired to Ollama, carries all VM credentials, and exposes the Web UI.
+  # ────────────────────────────────────────────────────────────────────────────
+  openclaw:
+    build:
+      context: . # Root of this repo (contains Dockerfile)
+      dockerfile: Dockerfile
+    privileged: true
+    user: root
+    restart: unless-stopped
+
+    command: >
+      bash -c "
+      sleep 5 &&
+      sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf &&
+      find /home/node/ -maxdepth 1 -name \"vm_mount_*\" -exec fusermount3 -u -z {} \\; >/dev/null 2>&1 || true &&
+      find /home/node/ -maxdepth 1 -name \"vm_mount_*\" -exec rm -rf {} \\; >/dev/null 2>&1 || true &&
+      VM_DIR=\"/home/node/vm_mount_$$(date +%s)\" &&
+      mkdir -p \"$$VM_DIR\" &&
+      chown node:node \"$$VM_DIR\" &&
+      rm -f /home/node/.openclaw/workspace/vm &&
+      ln -sf \"$$VM_DIR\" /home/node/.openclaw/workspace/vm &&
+      chown -h node:node /home/node/.openclaw/workspace/vm &&
+      (
+        while true; do
+          echo \"[watchdog] Checking mount state for $$VM_DIR...\" >> /home/node/mount.log
+          if ! grep -q \" $$VM_DIR \" /proc/mounts; then
+            echo \"[watchdog] Not mounted. Mounting...\" >> /home/node/mount.log
+            sshpass -p \"$$TARGET_VM_PASSWORD\" sshfs -o port=$$TARGET_VM_PORT,StrictHostKeyChecking=no,UserKnownHostsFile=/dev/null,allow_other ref-it@$$TARGET_VM_IP:/home/ref-it \"$$VM_DIR\" >> /home/node/mount.log 2>&1
+          elif ! runuser -u node -- ls \"$$VM_DIR\" >/dev/null 2>&1; then
+            echo \"[watchdog] Stale mount detected. Unmounting and remounting...\" >> /home/node/mount.log
+            fusermount3 -u -z \"$$VM_DIR\" >> /home/node/mount.log 2>&1 || umount -f \"$$VM_DIR\" >> /home/node/mount.log 2>&1
+            sshpass -p \"$$TARGET_VM_PASSWORD\" sshfs -o port=$$TARGET_VM_PORT,StrictHostKeyChecking=no,UserKnownHostsFile=/dev/null,allow_other ref-it@$$TARGET_VM_IP:/home/ref-it \"$$VM_DIR\" >> /home/node/mount.log 2>&1
+          else
+            echo \"[watchdog] Mounted and healthy.\" >> /home/node/mount.log
+          fi
+          sleep 10
+        done
+      ) &
+      sleep 2 &&
+      export HOME=/home/node && runuser -u node -- node openclaw.mjs gateway --allow-unconfigured --bind lan
+      "
+
+    # ── Port mapping ──────────────────────────────────────────────────────────
+    ports:
+      - "18789:18789" # Host:18789 → Container:18789 (Web UI / Gateway)
+
+    # ── Persistent agent data storage ─────────────────────────────────────────
+    volumes:
+      - ./openclaw-data:/home/node/.openclaw # Persists config, logs, memory, workspace
+    depends_on:
+      ollama:
+        condition: service_healthy # Ollama API must be up
+      ollama-init:
+        condition: service_completed_successfully # All models must be pulled
+
+    # ── Full environment variable injection ───────────────────────────────────
+    environment:
+      # ── Ollama connection ─────────────────────────────────────────────────
+      OLLAMA_BASE_URL: "${OLLAMA_BASE_URL}"
+      OLLAMA_MODEL_NAME: "${OLLAMA_MODEL_NAME}"
+
+      # ── OpenClaw gateway token and secrets ────────────────────────────────
+      # Maps our OPENCLAW_ADMIN_PASSWORD env variable directly to OpenClaw's expected token
+      OPENCLAW_GATEWAY_TOKEN: "${OPENCLAW_ADMIN_PASSWORD}"
+      OPENCLAW_ADMIN_PASSWORD: "${OPENCLAW_ADMIN_PASSWORD}"
+      OPENCLAW_SECRET_KEY: "${OPENCLAW_SECRET_KEY}"
+      OPENCLAW_AGENT_CONCURRENCY: "${OPENCLAW_AGENT_CONCURRENCY}"
+      OPENCLAW_TOOL_TIMEOUT: "${OPENCLAW_TOOL_TIMEOUT}"
+      OPENCLAW_LOG_LEVEL: "${OPENCLAW_LOG_LEVEL}"
+      OPENCLAW_DATA_DIR: "/home/node/.openclaw"
+      OPENCLAW_WEB_AUTO_LOGIN: "true"
+      OPENCLAW_WEB_AUTO_LOGIN_TOKEN: "${OPENCLAW_ADMIN_PASSWORD}"
+      TOOLS_ALLOW: "${TOOLS_ALLOW}"
+      OLLAMA_MODEL_TOOL_SUPPORT: "${OLLAMA_MODEL_TOOL_SUPPORT}"
+      OPENCLAW_DISABLE_META_AGENT: "${OPENCLAW_DISABLE_META_AGENT}"
+      OPENCLAW_FORCE_TOOL_INJECTION: "${OPENCLAW_FORCE_TOOL_INJECTION}"
+
+      # ── External AI provider keys (failover routing) ──────────────────────
+      GEMINI_API_KEY: "${GEMINI_API_KEY}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      OPENAI_BASE_URL: "${OPENAI_BASE_URL}"
+
+      # ── VirtualBox target VM credentials ─────────────────────────────────
+      TARGET_VM_IP: "${TARGET_VM_IP}"
+      TARGET_VM_PORT: "${TARGET_VM_PORT}"
+      TARGET_VM_USER: "${TARGET_VM_USER}"
+      TARGET_VM_PASSWORD: "${TARGET_VM_PASSWORD}"
+      TARGET_VM_KEY_PATH: "${TARGET_VM_KEY_PATH}"
+
+    # ── Health check ──────────────────────────────────────────────────────────
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:18789/" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    # ── Network attachment ─────────────────────────────────────────────────────
+    networks:
+      - agent-net
+
+    # ── Logging ───────────────────────────────────────────────────────────────
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+# ==============================================================================
+#  NETWORKS
+#  agent-net: Isolated bridge — containers communicate by service name DNS.
+#             Host routing table is preserved so the agent can reach TARGET_VM_IP
+#             on the VirtualBox Host-Only adapter without gateway conflicts.
+# ==============================================================================
+networks:
+  agent-net:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: br-agentnet # Named bridge for iptables clarity
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.30.0.0/24 # Dedicated subnet — avoids collision with VirtualBox ranges
+          gateway: 172.30.0.1

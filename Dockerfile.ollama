@@ -1,0 +1,81 @@
+# ==============================================================================
+#  Custom Ollama Image — Hardware Scanner Edition
+#
+#  Extends: ollama/ollama:latest  (Ubuntu 22.04 base)
+#  Adds   : llm-checker (npm), llmfit (cargo/Rust), whichllm (uv/Python)
+#  Exposes: /scan.sh startup wrapper that reads host specs and recommends models
+#
+#  Hardware visibility strategy:
+#    • nvidia-smi  → GPU/VRAM (via NVIDIA runtime passthrough — already works)
+#    • /host/proc  → Host CPU model, core count, RAM (bind-mounted in compose)
+#    • /sys/class  → PCI device tree, GPU topology (bind-mounted in compose)
+#    • pid: host   → Full host process namespace (compose setting)
+# ==============================================================================
+
+FROM ollama/ollama:latest
+
+LABEL maintainer="ops@openclaw.local"
+LABEL description="Ollama + Hardware Scanner — sees host GPU/CPU/RAM, recommends models"
+
+# ── Prevent interactive prompts ───────────────────────────────────────────────
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ── Stage 1: System packages needed by all three scanner tools ────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # ── General utilities ───────────────────────────────────────────────────
+    curl \
+    wget \
+    ca-certificates \
+    jq \
+    pciutils \
+    dos2unix \
+    # ── Node.js 20 LTS (for llm-checker) ───────────────────────────────────
+    nodejs \
+    npm \
+    # ── Python 3 + pip (for whichllm via uv) ───────────────────────────────
+    python3 \
+    python3-pip \
+    python3-venv \
+    # ── Rust toolchain (for llmfit) ─────────────────────────────────────────
+    rustc \
+    cargo \
+    # ── Compile deps for cargo ──────────────────────────────────────────────
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# ── Stage 2: Install llm-checker globally via npm ────────────────────────────
+RUN npm install -g llm-checker 2>&1 | tail -5 \
+    && echo "✅ llm-checker installed: $(llm-checker --version 2>/dev/null || echo 'ok')"
+
+# ── Stage 3: Install llmfit via cargo ─────────────────────────────────────────
+# Rust compile is slow (~3-5 min) but runs once at image build time.
+# The binary lands at /root/.cargo/bin/llmfit and is symlinked to PATH.
+ENV CARGO_HOME=/root/.cargo
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN cargo install llmfit 2>&1 | tail -10 \
+    && ln -sf /root/.cargo/bin/llmfit /usr/local/bin/llmfit \
+    && echo "✅ llmfit installed: $(llmfit --version 2>/dev/null || echo 'ok')"
+
+# ── Stage 4: Install uv + whichllm ───────────────────────────────────────────
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && /root/.local/bin/uv tool install whichllm \
+    && ln -sf /root/.local/bin/whichllm /usr/local/bin/whichllm 2>/dev/null || true \
+    && echo "✅ whichllm installed"
+
+# ── Stage 5: Add scan script ──────────────────────────────────────────────────
+COPY scan.sh /scan.sh
+# Fix Windows CRLF → LF (safe to run even if already LF)
+RUN dos2unix /scan.sh && chmod +x /scan.sh
+
+# ── Stage 6: Mount points for host hardware visibility ────────────────────────
+# These directories are bind-mounted from the host in docker-compose.yml:
+#   /host/proc  ← host /proc (CPU, RAM info)
+#   /host/sys   ← host /sys  (PCI, GPU topology)
+RUN mkdir -p /host/proc /host/sys /scan
+
+# ── Runtime: swap the entrypoint to our scan wrapper ──────────────────────────
+# /scan.sh reads hardware, prints recommendations, then calls `exec ollama serve`
+ENTRYPOINT ["/scan.sh"]

@@ -1,0 +1,171 @@
+# ==============================================================================
+#  Ansible Variables — Ollama Model Stack
+#  Curated for: web browsing agents, page/project context understanding,
+#               workflow analysis, and site interaction automation.
+#
+#  Model selection strategy:
+#    - ROUTER   : fast, cheap — classifies task, routes to correct specialist
+#    - VISION   : reads page screenshots and UI layout
+#    - AGENT    : reasons + calls tools + plans multi-step browser actions
+#    - EMBED    : semantic search over project/page content (RAG pipeline)
+# ==============================================================================
+
+# ── Ollama install source ──────────────────────────────────────────────────────
+ollama_install_script: "https://ollama.com/install.sh"
+ollama_version: "latest"
+
+# ── Ollama service configuration ──────────────────────────────────────────────
+ollama_service_name: ollama
+ollama_listen_host: "0.0.0.0"
+ollama_listen_port: 11434
+ollama_data_dir: /usr/share/ollama/.ollama
+
+# ── GPU / performance tuning ──────────────────────────────────────────────────
+ollama_flash_attention: "1"
+ollama_keep_alive: "24h"
+ollama_num_parallel: "4"
+
+# ── Systemd service environment overrides ─────────────────────────────────────
+ollama_env_overrides:
+  OLLAMA_HOST: "{{ ollama_listen_host }}:{{ ollama_listen_port }}"
+  OLLAMA_FLASH_ATTENTION: "{{ ollama_flash_attention }}"
+  OLLAMA_KEEP_ALIVE: "{{ ollama_keep_alive }}"
+  OLLAMA_NUM_PARALLEL: "{{ ollama_num_parallel }}"
+  OLLAMA_MODELS: "{{ ollama_data_dir }}/models"
+
+# ── Firewall ──────────────────────────────────────────────────────────────────
+ollama_open_firewall: true
+ollama_firewall_source: "0.0.0.0/0"
+
+# ==============================================================================
+#  MODEL STACK — Web Agent + Page Understanding + Project Context
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+#  PRIMARY MODEL — AGENT REASONING + TOOL USE
+#  Role: The main "brain" of the browser agent loop. Plans multi-step actions,
+#        calls tools (click, type, scroll, extract), and decides next moves.
+#  Why: Best-in-class open model for structured output and tool calling.
+#       Outperforms llama3 on agent benchmarks. 128K context = reads full pages.
+# ------------------------------------------------------------------------------
+ollama_primary_model: "qwen2.5:7b"
+
+# ------------------------------------------------------------------------------
+#  VISION MODELS — PAGE SCREENSHOT UNDERSTANDING
+#  Role: Receives a screenshot of a web page and returns structured descriptions
+#        of UI elements, buttons, forms, layout, and interactive zones.
+#  Why: Essential for vision-based browser automation (e.g. Playwright + AI).
+# ------------------------------------------------------------------------------
+ollama_vision_models:
+  # Google Gemma 3 — open-source Gemini Flash equivalent
+  # Vision + tools, 4B fits in 6GB VRAM, extremely fast per token
+  # Best for: "What is on this page?", button detection, form field mapping
+  - name: "gemma3:4b"
+    role: "VISION | ROUTER"
+    vram_gb: 4
+    notes: "Google's open Gemini-Flash equivalent. Vision + tools. Fast."
+
+  # Gemma 3 12B — heavier but more accurate for complex page layouts
+  # Best for: multi-column dashboards, nested UI, complex SPA understanding
+  - name: "gemma3:12b"
+    role: "VISION | AGENT"
+    vram_gb: 10
+    notes: "Stronger Gemma. Better at complex layouts and longer page context."
+
+  # LLaVA — foundational open multimodal model
+  # Reads screenshots → describes what it sees in natural language
+  # Best for: page context narration, OCR-adjacent tasks
+  - name: "llava:7b"
+    role: "VISION"
+    vram_gb: 6
+    notes: "Screenshot → text. Core multimodal tool for browser agents."
+
+  # Moondream 2 — ultra-tiny 1.8B vision model
+  # Best for: extremely fast visual checks, lightweight pre-screening
+  # Runs comfortably on CPU if GPU is busy with primary model
+  - name: "moondream"
+    role: "VISION | FAST"
+    vram_gb: 2
+    notes: "1.8B params. Fastest vision model. Pre-screens pages before full analysis."
+
+# ------------------------------------------------------------------------------
+#  AGENT / REASONING MODELS — MULTI-STEP BROWSER WORKFLOW
+#  Role: Plan sequences of actions across a website, understand project
+#        workflow from code or docs, decompose goals into subtasks.
+# ------------------------------------------------------------------------------
+ollama_agent_models:
+  # Nous Hermes 3 — purpose-built for agentic and function-calling workflows
+  # Trained specifically to follow system prompts, call tools, and chain reasoning
+  # Best for: OpenClaw agent loops, project context extraction, workflow planning
+  - name: "hermes3"
+    role: "AGENT | REASONING"
+    vram_gb: 6
+    notes: "Nous Research. Best open model for agentic instruction following + tool calling."
+
+  # Qwen 2.5 Coder 7B — code-aware agent
+  # Understands project file trees, code comments, imports, and workflow
+  # Best for: reading source files, understanding build pipelines, codebase nav
+  - name: "qwen2.5-coder:7b"
+    role: "AGENT | CODE | PROJECT CONTEXT"
+    vram_gb: 6
+    notes: "Code-specialist agent. Understands project structure and dev workflows."
+
+  # DeepSeek-R1 1.5B — tiny reasoning model with thinking chains
+  # Best for: fast boolean decisions in agent loops (e.g. 'is this a login page?')
+  - name: "deepseek-r1:1.5b"
+    role: "ROUTER | REASONING | FAST"
+    vram_gb: 2
+    notes: "1.5B thinking model. Extremely fast logical yes/no decisions in agent loops."
+
+  # Phi-4 Mini — Microsoft's punches-above-weight-class small model
+  # 3.8B params but beats many 7B models on instruction following
+  # Best for: lightweight task classification, intent parsing from page text
+  - name: "phi4-mini"
+    role: "ROUTER | LIGHT"
+    vram_gb: 3
+    notes: "Microsoft Phi-4 Mini. 3.8B. Excellent instruction following for its size."
+
+# ------------------------------------------------------------------------------
+#  EMBEDDING MODEL — SEMANTIC SEARCH OVER PROJECT / PAGE CONTENT
+#  Role: Convert page text, project docs, or code into vector embeddings.
+#        Powers the RAG (Retrieval Augmented Generation) pipeline so agents
+#        can semantically search across large pages or codebases.
+#  NOTE: Embedding models use the /api/embeddings endpoint, not /api/chat.
+# ------------------------------------------------------------------------------
+ollama_embedding_models:
+  # nomic-embed-text — best open embedding model for long documents
+  # 8192 token context window — handles full web pages in one shot
+  - name: "nomic-embed-text"
+    role: "EMBEDDING | RAG"
+    vram_gb: 1
+    notes: "8K context window embedding. Power the RAG pipeline over pages + docs."
+
+# ==============================================================================
+#  FLAT MODEL LIST — used by the Ansible playbook pull tasks
+#  Edit this list to control exactly what gets downloaded.
+#  Comment out models you don't want to avoid large downloads.
+# ==============================================================================
+ollama_extra_models:
+  # ── Google Gemma 3 (open Gemini Flash) — Vision + Tools ───────────────────
+  - gemma3:4b         # ~3.3 GB — primary fast vision model
+  - gemma3:12b        # ~8.1 GB — deeper page understanding
+
+  # ── Nous Hermes 3 — Agentic reasoning ────────────────────────────────────
+  - hermes3           # ~4.7 GB — best open agent model
+
+  # ── Lightweight but powerful ──────────────────────────────────────────────
+  - phi4-mini         # ~2.5 GB — fast router / intent classifier
+  - deepseek-r1:1.5b  # ~1.1 GB — tiny but reasons well; agent loop decider
+
+  # ── Vision / Screenshot understanding ────────────────────────────────────
+  - llava:7b          # ~4.7 GB — screenshot → text narration
+  - moondream         # ~1.7 GB — ultra-fast visual pre-screener
+
+  # ── Code + project context ────────────────────────────────────────────────
+  - qwen2.5-coder:7b  # ~4.7 GB — understands code, imports, project structure
+
+  # ── Embedding / RAG ───────────────────────────────────────────────────────
+  - nomic-embed-text  # ~274 MB — semantic search over pages and docs
+
+# Pull only the primary model if set to true (skips ollama_extra_models)
+ollama_primary_only: false

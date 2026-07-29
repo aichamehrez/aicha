@@ -1,0 +1,12 @@
+.env
+openclaw-data/logs/
+openclaw-data/state/
+openclaw-data/media/
+openclaw-data/identity/
+openclaw-data/*.bak*
+openclaw-data/update-check.json
+ollama-data/
+ollama-scan/
+openclaw-data/plugin-skills/
+__pycache__/
+node_modules/

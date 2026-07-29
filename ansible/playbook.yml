@@ -1,0 +1,468 @@
+---
+# ==============================================================================
+#  Ansible Playbook: Ollama Install + Model Download + GPU Configuration
+#
+#  What this does:
+#    1. Detects OS family and installs required dependencies
+#    2. Downloads and runs the official Ollama install script
+#    3. Writes a systemd drop-in with GPU + performance environment vars
+#    4. Enables and starts the Ollama service
+#    5. Verifies the API is healthy
+#    6. Pulls the primary model + any extra models defined in vars/ollama.yml
+#    7. Confirms each model is listed in the Ollama registry
+#
+#  Run:
+#    ansible-playbook -i inventory.ini playbook.yml
+#    ansible-playbook -i inventory.ini playbook.yml -e "ollama_primary_model=mistral"
+# ==============================================================================
+
+- name: Ollama Setup — Install, Configure, and Pull Models
+  hosts: ollama_hosts
+  become: true
+  gather_facts: true
+
+  vars_files:
+    - vars/ollama.yml
+
+  # ── Pre-flight checks ────────────────────────────────────────────────────────
+  pre_tasks:
+    - name: "PRE | Assert OS is Debian/Ubuntu or RHEL/CentOS"
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family in ['Debian', 'RedHat']
+        fail_msg: >
+          Unsupported OS family: {{ ansible_os_family }}.
+          This playbook targets Debian/Ubuntu and RHEL/CentOS only.
+        success_msg: "OS check passed: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+    - name: "PRE | Display deployment summary"
+      ansible.builtin.debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " Target host   : {{ inventory_hostname }} ({{ ansible_host }})"
+          - " OS            : {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - " Primary model : {{ ollama_primary_model }}  [AGENT / TOOL USE]"
+          - " Vision models : {{ ollama_vision_models | map(attribute='name') | join(', ') }}"
+          - " Agent models  : {{ ollama_agent_models | map(attribute='name') | join(', ') }}"
+          - " Embed models  : {{ ollama_embedding_models | map(attribute='name') | join(', ') }}"
+          - " Extra pull list (flat): {{ ollama_extra_models | join(', ') if not ollama_primary_only else 'SKIPPED' }}"
+          - " Listen port   : {{ ollama_listen_port }}"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  # ── Task blocks ──────────────────────────────────────────────────────────────
+  tasks:
+
+    # ── Block 1: System Dependencies ─────────────────────────────────────────
+    - name: "DEPS | Install prerequisites on Debian/Ubuntu"
+      ansible.builtin.apt:
+        name:
+          - curl
+          - wget
+          - ca-certificates
+          - gnupg
+          - lsb-release
+          - pciutils          # lspci — GPU detection
+          - jq                # JSON parsing for API checks
+          - nodejs            # Required by llm-checker (npm tool)
+          - npm               # Node package manager for llm-checker
+          - python3-pip       # Required by whichllm
+          - python3-venv      # uv / pip venv support
+          - rustc             # Required by llmfit (Rust binary)
+          - cargo             # Rust package manager for llmfit
+          - build-essential   # gcc, make — needed for cargo compile
+          - pkg-config        # Needed by cargo build deps
+          - libssl-dev        # OpenSSL headers for cargo
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      when: ansible_os_family == 'Debian'
+
+    - name: "DEPS | Install prerequisites on RHEL/CentOS"
+      ansible.builtin.dnf:
+        name:
+          - curl
+          - wget
+          - ca-certificates
+          - gnupg2
+          - pciutils
+          - jq
+          - nodejs            # Required by llm-checker
+          - npm
+          - python3-pip
+          - rust              # Required by llmfit
+          - cargo
+          - gcc
+          - openssl-devel
+          - pkgconfig
+        state: present
+      when: ansible_os_family == 'RedHat'
+
+    # ── Block 2: GPU Detection (informational) ───────────────────────────────
+    - name: "GPU | Detect NVIDIA GPU presence"
+      ansible.builtin.command: lspci
+      register: lspci_output
+      changed_when: false
+      failed_when: false
+
+    - name: "GPU | Report GPU detection result"
+      ansible.builtin.debug:
+        msg: >
+          {{ 'NVIDIA GPU DETECTED — hardware acceleration will be used.'
+             if 'NVIDIA' in lspci_output.stdout
+             else 'WARNING: No NVIDIA GPU detected. Ollama will run in CPU-only mode.' }}
+
+    - name: "GPU | Set gpu_present fact"
+      ansible.builtin.set_fact:
+        gpu_present: "{{ 'NVIDIA' in lspci_output.stdout }}"
+
+    # ── Block 3: Ollama Installation ─────────────────────────────────────────
+    - name: "INSTALL | Check if Ollama is already installed"
+      ansible.builtin.stat:
+        path: /usr/local/bin/ollama
+      register: ollama_binary
+
+    - name: "INSTALL | Download the Ollama install script"
+      ansible.builtin.get_url:
+        url: "{{ ollama_install_script }}"
+        dest: /tmp/ollama_install.sh
+        mode: "0755"
+        force: true
+      when: not ollama_binary.stat.exists
+
+    - name: "INSTALL | Execute the Ollama install script"
+      ansible.builtin.command:
+        cmd: /tmp/ollama_install.sh
+      environment:
+        OLLAMA_VERSION: "{{ ollama_version if ollama_version != 'latest' else '' }}"
+      register: ollama_install_result
+      changed_when: "'ollama' in ollama_install_result.stdout"
+      when: not ollama_binary.stat.exists
+
+    - name: "INSTALL | Clean up installer script"
+      ansible.builtin.file:
+        path: /tmp/ollama_install.sh
+        state: absent
+
+    - name: "INSTALL | Verify Ollama binary exists and capture version"
+      ansible.builtin.command: /usr/local/bin/ollama --version
+      register: ollama_version_output
+      changed_when: false
+
+    - name: "INSTALL | Print installed Ollama version"
+      ansible.builtin.debug:
+        msg: "Ollama installed: {{ ollama_version_output.stdout }}"
+
+    # ── Block 4: Systemd Service Configuration ───────────────────────────────
+    - name: "SERVICE | Create systemd drop-in directory for Ollama"
+      ansible.builtin.file:
+        path: /etc/systemd/system/ollama.service.d
+        state: directory
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: "SERVICE | Write GPU + performance environment drop-in override"
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/ollama.service.d/override.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # ── Ollama systemd environment override ──────────────────────────────
+          # Managed by Ansible — do not edit manually
+          [Service]
+          {% for key, value in ollama_env_overrides.items() %}
+          Environment="{{ key }}={{ value }}"
+          {% endfor %}
+          {% if gpu_present %}
+          # NVIDIA GPU optimisation flags
+          Environment="CUDA_VISIBLE_DEVICES=all"
+          Environment="NVIDIA_VISIBLE_DEVICES=all"
+          {% endif %}
+          # Restart policy
+          Restart=always
+          RestartSec=5
+      notify: Reload and restart Ollama
+
+    - name: "SERVICE | Ensure Ollama data directory exists"
+      ansible.builtin.file:
+        path: "{{ ollama_data_dir }}"
+        state: directory
+        mode: "0755"
+        owner: ollama
+        group: ollama
+      ignore_errors: true   # ollama user created by install script; may not exist yet
+
+    - name: "SERVICE | Reload systemd daemon"
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: "SERVICE | Enable and start Ollama service"
+      ansible.builtin.systemd:
+        name: "{{ ollama_service_name }}"
+        enabled: true
+        state: started
+
+    # ── Block 5: Firewall Rules ───────────────────────────────────────────────
+    - name: "FIREWALL | Open Ollama port via UFW (Debian/Ubuntu)"
+      community.general.ufw:
+        rule: allow
+        port: "{{ ollama_listen_port | string }}"
+        proto: tcp
+        src: "{{ ollama_firewall_source }}"
+        comment: "Ollama API — managed by Ansible"
+      when:
+        - ollama_open_firewall
+        - ansible_os_family == 'Debian'
+      ignore_errors: true   # UFW may not be active on all Ubuntu installs
+
+    - name: "FIREWALL | Open Ollama port via firewalld (RHEL/CentOS)"
+      ansible.posix.firewalld:
+        port: "{{ ollama_listen_port }}/tcp"
+        permanent: true
+        immediate: true
+        state: enabled
+      when:
+        - ollama_open_firewall
+        - ansible_os_family == 'RedHat'
+      ignore_errors: true
+
+    # ── Block 6: Health Verification ─────────────────────────────────────────
+    - name: "HEALTH | Wait for Ollama API to become reachable (max 60s)"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ ollama_listen_port }}/api/tags"
+        method: GET
+        status_code: 200
+      register: ollama_health
+      until: ollama_health.status == 200
+      retries: 12
+      delay: 5
+
+    - name: "HEALTH | Ollama API is up"
+      ansible.builtin.debug:
+        msg: "✅ Ollama API responded on port {{ ollama_listen_port }}"
+
+    # ── Block 7: Pull Primary Model ───────────────────────────────────────────
+    - name: "MODEL | Check if primary model is already present"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ ollama_listen_port }}/api/tags"
+        method: GET
+        return_content: true
+      register: existing_models_raw
+
+    - name: "MODEL | Parse existing model names into a list"
+      ansible.builtin.set_fact:
+        existing_model_names: >-
+          {{ existing_models_raw.json.models
+             | default([])
+             | map(attribute='name')
+             | list }}
+
+    - name: "MODEL | Pull primary model — {{ ollama_primary_model }}"
+      ansible.builtin.command:
+        cmd: "/usr/local/bin/ollama pull {{ ollama_primary_model }}"
+      environment:
+        OLLAMA_HOST: "http://127.0.0.1:{{ ollama_listen_port }}"
+      register: pull_primary_result
+      changed_when: true
+      async: 3600           # Allow up to 1 hour for large model downloads
+      poll: 30              # Check progress every 30 seconds
+      when: ollama_primary_model not in existing_model_names
+
+    - name: "MODEL | Primary model already present — skipping download"
+      ansible.builtin.debug:
+        msg: "Model '{{ ollama_primary_model }}' is already downloaded. Skipping."
+      when: ollama_primary_model in existing_model_names
+
+    # ── Block 8: Pull Extra Models ────────────────────────────────────────────
+    - name: "MODEL | Pull extra models"
+      ansible.builtin.command:
+        cmd: "/usr/local/bin/ollama pull {{ item }}"
+      environment:
+        OLLAMA_HOST: "http://127.0.0.1:{{ ollama_listen_port }}"
+      register: pull_extra_result
+      changed_when: true
+      async: 3600
+      poll: 30
+      loop: "{{ ollama_extra_models }}"
+      when:
+        - not ollama_primary_only
+        - item not in existing_model_names
+
+    # ── Block 9: Final Verification ───────────────────────────────────────────
+    - name: "VERIFY | Retrieve final model list from Ollama"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ ollama_listen_port }}/api/tags"
+        method: GET
+        return_content: true
+      register: final_model_list
+
+    - name: "VERIFY | Display all models now registered in Ollama"
+      ansible.builtin.debug:
+        msg: >-
+          {{ final_model_list.json.models
+             | default([])
+             | map(attribute='name')
+             | list }}
+
+    - name: "VERIFY | Assert primary model is present"
+      ansible.builtin.assert:
+        that:
+          - final_model_list.json.models
+              | default([])
+              | selectattr('name', 'search', ollama_primary_model)
+              | list
+              | length > 0
+        fail_msg: "FAILED: Primary model '{{ ollama_primary_model }}' was not found after pull attempt!"
+        success_msg: "✅ Primary model '{{ ollama_primary_model }}' confirmed present."
+
+    # ── Block 10: Hardware-Aware Model Discovery Tools ────────────────────────
+    # Three tools that scan GPU/CPU/RAM and recommend the best Ollama models
+    # for the specific hardware they find on this machine.
+
+    - name: "SCANTOOLS | Check if llm-checker (npm) is already installed"
+      ansible.builtin.command: npm list -g llm-checker --depth=0
+      register: llmchecker_check
+      changed_when: false
+      failed_when: false
+
+    - name: "SCANTOOLS | Install llm-checker globally via npm"
+      ansible.builtin.command: npm install -g llm-checker
+      when: llmchecker_check.rc != 0
+      register: llmchecker_install
+      changed_when: true
+
+    - name: "SCANTOOLS | Verify llm-checker version"
+      ansible.builtin.command: llm-checker --version
+      register: llmchecker_ver
+      changed_when: false
+      failed_when: false
+
+    - name: "SCANTOOLS | Print llm-checker version"
+      ansible.builtin.debug:
+        msg: "llm-checker installed: {{ llmchecker_ver.stdout | default('unknown') }}"
+
+    - name: "SCANTOOLS | Check if llmfit (Rust/cargo) is already installed"
+      ansible.builtin.stat:
+        path: /usr/local/bin/llmfit
+      register: llmfit_binary
+
+    - name: "SCANTOOLS | Check llmfit in cargo bin"
+      ansible.builtin.stat:
+        path: /root/.cargo/bin/llmfit
+      register: llmfit_cargo_bin
+
+    - name: "SCANTOOLS | Install llmfit via cargo (compiles from source — may take 2-5 min)"
+      ansible.builtin.command:
+        cmd: cargo install llmfit
+      environment:
+        HOME: /root
+        CARGO_HOME: /root/.cargo
+      register: llmfit_install
+      changed_when: "'Installing' in llmfit_install.stdout or 'Compiling' in llmfit_install.stdout"
+      async: 600       # Up to 10 minutes for first-time Rust compile
+      poll: 30
+      when:
+        - not llmfit_binary.stat.exists
+        - not llmfit_cargo_bin.stat.exists
+
+    - name: "SCANTOOLS | Verify llmfit is accessible"
+      ansible.builtin.command: /root/.cargo/bin/llmfit --version
+      register: llmfit_ver
+      changed_when: false
+      failed_when: false
+
+    - name: "SCANTOOLS | Print llmfit version"
+      ansible.builtin.debug:
+        msg: "llmfit installed: {{ llmfit_ver.stdout | default('unknown') }}"
+
+    - name: "SCANTOOLS | Install uv (Python package manager) for whichllm"
+      ansible.builtin.shell: |
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+      args:
+        creates: /root/.local/bin/uv
+      environment:
+        HOME: /root
+
+    - name: "SCANTOOLS | Install whichllm via uv tool"
+      ansible.builtin.command:
+        cmd: /root/.local/bin/uv tool install whichllm
+      environment:
+        HOME: /root
+      register: whichllm_install
+      changed_when: true
+      failed_when: false   # uv returns non-zero if already installed; that's fine
+
+    - name: "SCANTOOLS | Verify whichllm is accessible"
+      ansible.builtin.command: /root/.local/bin/whichllm --version
+      register: whichllm_ver
+      changed_when: false
+      failed_when: false
+
+    - name: "SCANTOOLS | Print whichllm version"
+      ansible.builtin.debug:
+        msg: "whichllm installed: {{ whichllm_ver.stdout | default('checking...') }}"
+
+    # ── Run the hardware scan and print recommendations NOW ───────────────────
+    - name: "SCANTOOLS | Run llm-checker hardware detection"
+      ansible.builtin.command: llm-checker hw-detect
+      register: hw_detect_output
+      changed_when: false
+      failed_when: false
+
+    - name: "SCANTOOLS | Display hardware profile from llm-checker"
+      ansible.builtin.debug:
+        msg: "{{ hw_detect_output.stdout_lines | default(['llm-checker hw-detect output unavailable']) }}"
+
+    - name: "SCANTOOLS | Run llm-checker model recommendations"
+      ansible.builtin.command: llm-checker recommend
+      register: llmchecker_recs
+      changed_when: false
+      failed_when: false
+
+    - name: "SCANTOOLS | Display llm-checker model recommendations for this hardware"
+      ansible.builtin.debug:
+        msg: "{{ llmchecker_recs.stdout_lines | default(['llm-checker recommend output unavailable']) }}"
+
+    - name: "SCANTOOLS | Run llmfit hardware compatibility scan"
+      ansible.builtin.command: /root/.cargo/bin/llmfit
+      register: llmfit_output
+      changed_when: false
+      failed_when: false
+
+    - name: "SCANTOOLS | Display llmfit hardware-fit analysis"
+      ansible.builtin.debug:
+        msg: "{{ llmfit_output.stdout_lines | default(['llmfit output unavailable — run manually: llmfit']) }}"
+
+  # ── Handlers ─────────────────────────────────────────────────────────────────
+  handlers:
+    - name: Reload and restart Ollama
+      ansible.builtin.systemd:
+        name: "{{ ollama_service_name }}"
+        daemon_reload: true
+        state: restarted
+
+  # ── Post-play summary ────────────────────────────────────────────────────────
+  post_tasks:
+    - name: "DONE | Deployment summary"
+      ansible.builtin.debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - " ✅ Ollama is running   : {{ ansible_host }}:{{ ollama_listen_port }}"
+          - " ✅ Primary (agent)     : {{ ollama_primary_model }}"
+          - " ✅ Vision models       : {{ ollama_vision_models | map(attribute='name') | join(', ') }}"
+          - " ✅ Agent models        : {{ ollama_agent_models | map(attribute='name') | join(', ') }}"
+          - " ✅ Embedding model     : {{ ollama_embedding_models | map(attribute='name') | join(', ') }}"
+          - "──────────────────────────────────────────────────────"
+          - " 🔍 HARDWARE SCANNER TOOLS (installed on target VM)"
+          - "  • llm-checker  → llm-checker hw-detect"
+          - "                   llm-checker recommend"
+          - "                   llm-checker recommend --category coding"
+          - "  • llmfit       → llmfit  (interactive TUI — shows fit score per model)"
+          - "  • whichllm     → whichllm  (benchmark-ranked suggestions for your GPU)"
+          - "                   whichllm --gpu-only --speed usable --vram-headroom 1GB"
+          - "──────────────────────────────────────────────────────"
+          - " ℹ️  List all models : curl http://{{ ansible_host }}:{{ ollama_listen_port }}/api/tags | jq '.models[].name'"
+          - " ℹ️  Test vision     : ollama run gemma3:4b 'Describe a web login page'"
+          - " ℹ️  Test agent      : ollama run hermes3 'Plan how to fill a web form'"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
