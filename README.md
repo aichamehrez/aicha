@@ -39,7 +39,7 @@ Git.
 
 2. Cloner le dépôt
 Bash
-git clone https://github.com/aichamehrez/aicha.git
+git clone [https://github.com/aichamehrez/aicha.git](https://github.com/aichamehrez/aicha.git)
 cd aicha
 3. Configurer l'environnement
 Copiez le modèle de configuration et adaptez-le à votre environnement local :
@@ -55,10 +55,3 @@ docker compose up -d
 Les clés d'accès, mots de passe de VM et données temporaires sont entièrement ignorés via le fichier .gitignore.
 
 Aucune donnée confidentielle ou clé API réelle n'est présente sur ce dépôt.
-
-
-4. Cliquez sur le bouton vert **"Commit changes..."** en haut à droite.
-
----
-
-Une fois validé, toutes les sections (dont **Installation et Démarrage**) apparaîtront clairement sous le bloc de structure !
